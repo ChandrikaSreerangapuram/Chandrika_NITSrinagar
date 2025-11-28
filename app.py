@@ -1,133 +1,72 @@
-from fastapi import FastAPI, HTTPException, UploadFile, File
-from pydantic import BaseModel
-import requests
-import pytesseract
-from pdf2image import convert_from_bytes
-from PIL import Image
 import io
-import re
-import uuid
-import time
+from fastapi import FastAPI, File, UploadFile
+from fastapi.responses import JSONResponse
 
-app = FastAPI(
-    title="HackRx Bill Extraction API",
-    version="1.0.0",
-    description="Extract line items, subtotal, totals from bills as per HackRx JSON format"
+from models.schema import InvoiceOutput
+from services.preprocess import preprocess_image
+from services.ocr import ocr_pages
+from services.parser import extract_header_fields, parse_line_items, extract_totals
+from services.fraud import image_anomalies
+from services.reconcile import (
+    deduplicate_items, compute_subtotals, sum_items,
+    compute_final_total, build_taxes_dict
 )
+from utils.files import load_pages
+from utils.math import approx_equal
 
-# ------------------------------------
-# OCR for an image
-# ------------------------------------
-def ocr_image(img: Image.Image):
-    return pytesseract.image_to_string(img)
+app = FastAPI(title="Invoice Extraction API")
 
-# ------------------------------------
-# Extract line items from text
-# ------------------------------------
-def extract_items(text):
-    pattern = r"([A-Za-z0-9\/\-\(\) ]+)\s+(\d+(?:\.\d+)?)\s+([\d,.]+)\s+([\d,.]+)"
-    items = []
+@app.post("/extract", response_model=InvoiceOutput)
+async def extract(file: UploadFile = File(...), lang: str = "eng"):
+    file_bytes = await file.read()
+    pages = load_pages(file_bytes, file.filename)
 
-    for match in re.findall(pattern, text):
-        name = match[0].strip()
-        qty = float(match[1])
-        rate = float(match[2].replace(",", ""))
-        amount = float(match[3].replace(",", ""))
+    preprocessed = [preprocess_image(p) for p in pages]
+    anomalies = []
 
-        items.append({
-            "item_name": name,
-            "item_quantity": qty,
-            "item_rate": rate,
-            "item_amount": amount
-        })
+    for p in preprocessed:
+        anomalies.extend(image_anomalies(p))
 
-    return items
+    text = ocr_pages(preprocessed, lang=lang)
 
+    headers = extract_header_fields(text)
+    items = deduplicate_items(parse_line_items(text))
+    totals_map = extract_totals(text)
+    sub_totals = compute_subtotals(text, items)
+    taxes = build_taxes_dict(totals_map)
 
-# ------------------------------------
-# Determine page type
-# ------------------------------------
-def detect_page_type(text):
-    text_lower = text.lower()
+    discount = totals_map.get("discount", 0.0)
+    printed_grand = totals_map.get("grand_total")
+    round_off = totals_map.get("round_off", 0.0)
+    printed_final = totals_map.get("final_amount_printed")
 
-    if "pharmacy" in text_lower or "drug" in text_lower or "medicine" in text_lower:
-        return "Pharmacy"
+    items_sum = sum_items(items)
+    taxes_total = taxes.total_tax or 0.0
+    final_total = compute_final_total(items_sum, discount, taxes_total, round_off, printed_final)
 
-    if "total" in text_lower and "final" in text_lower:
-        return "Final Bill"
+    if printed_final and not approx_equal(printed_final, final_total, eps=1.0):
+        anomalies.append("Computed final total differs significantly from printed final amount.")
 
-    return "Bill Detail"
-
-
-# ------------------------------------
-# Input JSON Schema
-# ------------------------------------
-class RequestBody(BaseModel):
-    document: str   # URL of bill
-
-
-# ------------------------------------
-# Main API Endpoint Required by HackRx
-# ------------------------------------
-@app.post("/extract-bill-data")
-async def extract_bill_data(body: RequestBody):
-
-    # Step 1: Download File
-    try:
-        response = requests.get(body.document)
-        content = response.content
-    except:
-        raise HTTPException(status_code=400, detail="Unable to fetch document")
-
-    pages_text = []
-    pagewise_items = []
-
-    # Step 2: PDF or Image?
-    if body.document.lower().endswith(".pdf"):
-        images = convert_from_bytes(content)
-    else:
-        img = Image.open(io.BytesIO(content))
-        images = [img]
-
-    total_token_in = 0
-    total_token_out = 0
-
-    # Step 3: Process each page
-    for idx, img in enumerate(images):
-        text = ocr_image(img)
-        pages_text.append(text)
-
-        items = extract_items(text)
-
-        page_type = detect_page_type(text)
-
-        pagewise_items.append({
-            "page_no": str(idx + 1),
-            "page_type": page_type,
-            "bill_items": items
-        })
-
-    # Step 4: Total item count
-    total_items = sum(len(p["bill_items"]) for p in pagewise_items)
-
-    # Token usage (dummy since no LLM used)
-    token_usage = {
-        "total_tokens": total_token_in + total_token_out,
-        "input_tokens": total_token_in,
-        "output_tokens": total_token_out
+    meta = {
+        "items_sum": str(items_sum),
+        "discount": str(discount),
+        "taxes_total": str(taxes_total),
+        "round_off": str(round_off),
+        "printed_grand_total": str(printed_grand),
+        "printed_final_amount": str(printed_final or final_total)
     }
 
-    # Final Response
-    return {
-        "is_success": True,
-        "token_usage": token_usage,
-        "data": {
-            "pagewise_line_items": pagewise_items,
-            "total_item_count": total_items
-        }
-    }
-
-
-@app.get("/")
-def root():
-    return {"message": "HackRx Bill Extraction API is running"}
+    return InvoiceOutput(
+        bill_no=headers.get("bill_no"),
+        bill_date=headers.get("bill_date"),
+        patient_name=headers.get("patient_name"),
+        line_items=items,
+        sub_totals=sub_totals,
+        discount=discount,
+        taxes=taxes,
+        grand_total=printed_grand,
+        round_off=round_off,
+        final_total=final_total,
+        meta=meta,
+        anomalies=anomalies
+    )
